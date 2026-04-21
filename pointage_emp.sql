@@ -96,19 +96,51 @@ CREATE TABLE IF NOT EXISTS `pointages` (
   `latitude` decimal(10,7) DEFAULT NULL,
   `longitude` decimal(10,7) DEFAULT NULL,
   `adresse` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `verification_method` enum('webauthn','otp_fallback') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'webauthn',
+  `otp_request_id` int DEFAULT NULL,
   `date_pointage` date NOT NULL,
   PRIMARY KEY (`id`),
   KEY `employe_id` (`employe_id`)
 ) ENGINE=MyISAM AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- --------------------------------------------------------
+
+--
+-- Structure de la table `otp_fallback_requests`
+--
+
+DROP TABLE IF EXISTS `otp_fallback_requests`;
+CREATE TABLE IF NOT EXISTS `otp_fallback_requests` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `employe_id` int NOT NULL,
+  `type` enum('arrivee','depart') COLLATE utf8mb4_unicode_ci NOT NULL,
+  `requested_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `requested_latitude` decimal(10,7) DEFAULT NULL,
+  `requested_longitude` decimal(10,7) DEFAULT NULL,
+  `requested_address` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `request_reason` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `status` enum('pending','approved','rejected','used','expired') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'pending',
+  `approved_by_admin_id` int DEFAULT NULL,
+  `approved_at` datetime DEFAULT NULL,
+  `rejected_by_admin_id` int DEFAULT NULL,
+  `rejected_at` datetime DEFAULT NULL,
+  `decision_note` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `otp_hash` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `otp_expires_at` datetime DEFAULT NULL,
+  `otp_used_at` datetime DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `employe_id` (`employe_id`),
+  KEY `status` (`status`)
+) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 --
 -- Déchargement des données de la table `pointages`
 --
 
-INSERT INTO `pointages` (`id`, `employe_id`, `type`, `heure`, `latitude`, `longitude`, `adresse`, `date_pointage`) VALUES
-(1, 1, 'arrivee', '2026-04-07 13:33:05', NULL, NULL, NULL, '2026-04-07'),
-(2, 2, 'depart', '2026-04-07 21:59:56', 36.7534503, 3.4727516, 'Centre commerciale El Yasmine, Rue Gare, Cité Ibn Khaldoun (1200 lgts), Promotion immo, Aliliguia, Boumerdès, Daïra Boumerdès, Boumerdès, 35000, Algérie', '2026-04-07'),
-(3, 2, 'arrivee', '2026-04-07 23:12:17', 36.7534503, 3.4727516, 'Centre commerciale El Yasmine, Rue Gare, Cité Ibn Khaldoun (1200 lgts), Promotion immo, Aliliguia, Boumerdès, Daïra Boumerdès, Boumerdès, 35000, Algérie', '2026-04-07');
+INSERT INTO `pointages` (`id`, `employe_id`, `type`, `heure`, `latitude`, `longitude`, `adresse`, `verification_method`, `otp_request_id`, `date_pointage`) VALUES
+(1, 1, 'arrivee', '2026-04-07 13:33:05', NULL, NULL, NULL, 'webauthn', NULL, '2026-04-07'),
+(2, 2, 'depart', '2026-04-07 21:59:56', 36.7534503, 3.4727516, 'Centre commerciale El Yasmine, Rue Gare, Cité Ibn Khaldoun (1200 lgts), Promotion immo, Aliliguia, Boumerdès, Daïra Boumerdès, Boumerdès, 35000, Algérie', 'webauthn', NULL, '2026-04-07'),
+(3, 2, 'arrivee', '2026-04-07 23:12:17', 36.7534503, 3.4727516, 'Centre commerciale El Yasmine, Rue Gare, Cité Ibn Khaldoun (1200 lgts), Promotion immo, Aliliguia, Boumerdès, Daïra Boumerdès, Boumerdès, 35000, Algérie', 'webauthn', NULL, '2026-04-07');
 COMMIT;
 
 /*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;

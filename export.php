@@ -15,7 +15,7 @@ $role     = $_SESSION['admin_role'] ?? 'subadmin';
 $admin_id = $_SESSION['admin_id'];
 
 // Filtres
-$filtre_mois = $_GET['mois']    ?? date('Y-m');   // ex: 2026-04
+$filtre_mois = $_GET['mois']    ?? (isset($_GET['date']) ? substr($_GET['date'], 0, 7) : date('Y-m'));   // ex: 2026-04
 $filtre_emp  = $_GET['employe'] ?? '';
 $filtre_code = trim($_GET['code']  ?? '');
 $filtre_nom  = trim($_GET['nom_f'] ?? '');
@@ -87,7 +87,7 @@ foreach ($semaines as $titre_sem => $lignes) {
     $sheet->setTitle($titre_sem);
 
     // Titre
-    $sheet->mergeCells('A1:H1');
+    $sheet->mergeCells('A1:I1');
     $sheet->setCellValue('A1', 'Rapport Pointage — ' . $nom_mois . ' — ' . $titre_sem);
     $sheet->getStyle('A1')->applyFromArray([
         'font'      => ['bold' => true, 'size' => 13, 'color' => ['rgb' => 'FFFFFF']],
@@ -97,11 +97,11 @@ foreach ($semaines as $titre_sem => $lignes) {
     $sheet->getRowDimension(1)->setRowHeight(28);
 
     // En-têtes
-    $cols = ['A'=>'Code','B'=>'Nom','C'=>'Prénom','D'=>'Poste','E'=>'Type','F'=>'Heure','G'=>'Date','H'=>'Localisation'];
+    $cols = ['A'=>'Code','B'=>'Nom','C'=>'Prénom','D'=>'Poste','E'=>'Type','F'=>'Heure','G'=>'Date','H'=>'Vérification','I'=>'Localisation'];
     foreach ($cols as $col => $titre) {
         $sheet->setCellValue($col.'2', $titre);
     }
-    $sheet->getStyle('A2:H2')->applyFromArray([
+    $sheet->getStyle('A2:I2')->applyFromArray([
         'font'      => ['bold' => true, 'color' => ['rgb' => 'FFFFFF']],
         'fill'      => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => '1D9E75']],
         'alignment' => ['horizontal' => Alignment::HORIZONTAL_CENTER],
@@ -121,10 +121,11 @@ foreach ($semaines as $titre_sem => $lignes) {
         $sheet->setCellValue('E'.$row, $type_label);
         $sheet->setCellValue('F'.$row, date('H:i', strtotime($p['heure'])));
         $sheet->setCellValue('G'.$row, date('d/m/Y', strtotime($p['date_pointage'])));
-        $sheet->setCellValue('H'.$row, $gps);
+        $sheet->setCellValue('H'.$row, ($p['verification_method'] ?? 'webauthn') === 'otp_fallback' ? 'OTP manager' : 'Empreinte');
+        $sheet->setCellValue('I'.$row, $gps);
 
         $bg = ($row % 2 === 0) ? 'F7F9FC' : 'FFFFFF';
-        $sheet->getStyle("A{$row}:H{$row}")->applyFromArray([
+        $sheet->getStyle("A{$row}:I{$row}")->applyFromArray([
             'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => $bg]],
         ]);
         $couleur = $p['type'] === 'arrivee' ? '0F6E56' : 'A32D2D';
@@ -135,26 +136,26 @@ foreach ($semaines as $titre_sem => $lignes) {
 
     // Bordures
     if ($row > 2) {
-        $sheet->getStyle("A2:H".($row-1))->applyFromArray([
+        $sheet->getStyle("A2:I".($row-1))->applyFromArray([
             'borders' => ['allBorders' => ['borderStyle' => Border::BORDER_THIN, 'color' => ['rgb' => 'E0E0E0']]],
         ]);
     }
 
     // Total
-    $sheet->mergeCells("A{$row}:E{$row}");
+    $sheet->mergeCells("A{$row}:F{$row}");
     $sheet->setCellValue("A{$row}", "Total : " . count($lignes) . " pointage(s)");
-    $sheet->getStyle("A{$row}:H{$row}")->applyFromArray([
+    $sheet->getStyle("A{$row}:I{$row}")->applyFromArray([
         'font' => ['bold' => true, 'italic' => true],
         'fill' => ['fillType' => Fill::FILL_SOLID, 'startColor' => ['rgb' => 'F0F4F8']],
     ]);
 
     // Largeurs
-    foreach (['A'=>12,'B'=>18,'C'=>18,'D'=>20,'E'=>12,'F'=>10,'G'=>14,'H'=>35] as $c=>$w) {
+    foreach (['A'=>12,'B'=>18,'C'=>18,'D'=>20,'E'=>12,'F'=>10,'G'=>14,'H'=>16,'I'=>35] as $c=>$w) {
         $sheet->getColumnDimension($c)->setWidth($w);
     }
     // Centrer
     if ($row > 3) {
-        $sheet->getStyle("A3:G".($row-1))->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
+        $sheet->getStyle("A3:H".($row-1))->getAlignment()->setHorizontal(Alignment::HORIZONTAL_CENTER);
     }
 }
 
