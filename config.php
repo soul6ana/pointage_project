@@ -11,4 +11,9 @@ try {
 } catch (PDOException $e) {
     die("Erreur connexion : " . $e->getMessage());
 }
-?>
+
+// Security and attendance policy settings.
+const OFFICE_LATITUDE = 36.7534503;
+const OFFICE_LONGITUDE = 3.4727516;
+const GEOFENCE_RADIUS_METERS = 120;
+const OTP_EXPIRY_MINUTES = 5;

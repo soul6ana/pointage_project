@@ -10,6 +10,13 @@ $role     = $_SESSION['admin_role'] ?? 'subadmin';
 $admin_id = $_SESSION['admin_id'];
 $tab      = $_GET['tab'] ?? 'pointages';
 
+$otpTableReady = false;
+try {
+  $otpTableReady = (bool)$pdo->query("SHOW TABLES LIKE 'otp_fallback_requests'")->fetchColumn();
+} catch (Throwable $e) {
+  $otpTableReady = false;
+}
+
 // ===== ACTIONS =====
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
@@ -48,6 +55,72 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         }
         header('Location: admin.php?tab=employes&msg=supprime'); exit;
     }
+
+    // Approuver demande OTP fallback
+    if ($_POST['action'] === 'approve_otp_request') {
+      if (!$otpTableReady) {
+        header('Location: admin.php?tab=otp&msg=otp_schema_missing'); exit;
+      }
+      $reqId = (int)($_POST['id'] ?? 0);
+      $note = trim($_POST['decision_note'] ?? '');
+
+      if ($role === 'superadmin') {
+        $rq = $pdo->prepare("SELECT r.id FROM otp_fallback_requests r WHERE r.id=? AND r.status='pending'");
+        $rq->execute([$reqId]);
+      } else {
+        $rq = $pdo->prepare(
+          "SELECT r.id FROM otp_fallback_requests r
+           JOIN employes e ON e.id = r.employe_id
+           WHERE r.id=? AND r.status='pending' AND e.created_by_admin=?"
+        );
+        $rq->execute([$reqId, $admin_id]);
+      }
+
+      if ($rq->fetch()) {
+        $otp = str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+        $otpHash = password_hash($otp, PASSWORD_DEFAULT);
+        $sql = "UPDATE otp_fallback_requests
+            SET status='approved', approved_by_admin_id=?, approved_at=NOW(), decision_note=?, otp_hash=?,
+              otp_expires_at=DATE_ADD(NOW(), INTERVAL " . OTP_EXPIRY_MINUTES . " MINUTE)
+            WHERE id=?";
+        $pdo->prepare($sql)->execute([$admin_id, $note ?: null, $otpHash, $reqId]);
+
+        $_SESSION['otp_flash'] = "OTP demande #$reqId : $otp (valide " . OTP_EXPIRY_MINUTES . " min)";
+      }
+
+      header('Location: admin.php?tab=otp'); exit;
+    }
+
+    // Rejeter demande OTP fallback
+    if ($_POST['action'] === 'reject_otp_request') {
+      if (!$otpTableReady) {
+        header('Location: admin.php?tab=otp&msg=otp_schema_missing'); exit;
+      }
+      $reqId = (int)($_POST['id'] ?? 0);
+      $note = trim($_POST['decision_note'] ?? '');
+
+      if ($role === 'superadmin') {
+        $rq = $pdo->prepare("SELECT r.id FROM otp_fallback_requests r WHERE r.id=? AND r.status='pending'");
+        $rq->execute([$reqId]);
+      } else {
+        $rq = $pdo->prepare(
+          "SELECT r.id FROM otp_fallback_requests r
+           JOIN employes e ON e.id = r.employe_id
+           WHERE r.id=? AND r.status='pending' AND e.created_by_admin=?"
+        );
+        $rq->execute([$reqId, $admin_id]);
+      }
+
+      if ($rq->fetch()) {
+        $pdo->prepare(
+          "UPDATE otp_fallback_requests
+           SET status='rejected', rejected_by_admin_id=?, rejected_at=NOW(), decision_note=?
+           WHERE id=?"
+        )->execute([$admin_id, $note ?: null, $reqId]);
+      }
+
+      header('Location: admin.php?tab=otp'); exit;
+    }
 }
 
 // ===== DONNÉES =====
@@ -62,6 +135,30 @@ $emp_ids = array_column($employes, 'id');
 $subadmins = [];
 if ($role === 'superadmin') {
     $subadmins = $pdo->query("SELECT * FROM admins WHERE role='subadmin' ORDER BY created_at DESC")->fetchAll(PDO::FETCH_ASSOC);
+}
+
+$otpFlash = $_SESSION['otp_flash'] ?? null;
+unset($_SESSION['otp_flash']);
+
+$otp_requests = [];
+if ($otpTableReady && $role === 'superadmin') {
+  $otp_requests = $pdo->query(
+    "SELECT r.*, e.code_employe, e.nom, e.prenom
+     FROM otp_fallback_requests r
+     JOIN employes e ON e.id=r.employe_id
+     WHERE r.status IN ('pending','approved')
+     ORDER BY r.requested_at DESC"
+  )->fetchAll(PDO::FETCH_ASSOC);
+} elseif ($otpTableReady) {
+  $sOtp = $pdo->prepare(
+    "SELECT r.*, e.code_employe, e.nom, e.prenom
+     FROM otp_fallback_requests r
+     JOIN employes e ON e.id=r.employe_id
+     WHERE e.created_by_admin=? AND r.status IN ('pending','approved')
+     ORDER BY r.requested_at DESC"
+  );
+  $sOtp->execute([$admin_id]);
+  $otp_requests = $sOtp->fetchAll(PDO::FETCH_ASSOC);
 }
 
 // Filtres
@@ -175,6 +272,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
     <nav>
       <a href="admin.php?tab=pointages" class="nav-item <?= $tab==='pointages'?'active':'' ?>">📋 Pointages</a>
       <a href="admin.php?tab=employes"  class="nav-item <?= $tab==='employes' ?'active':'' ?>">👥 Employés</a>
+      <a href="admin.php?tab=otp" class="nav-item <?= $tab==='otp'?'active':'' ?>">🔐 OTP fallback</a>
       <?php if($role==='superadmin'): ?><a href="admin.php?tab=subadmins" class="nav-item <?= $tab==='subadmins'?'active':'' ?>">🔑 Sous-admins</a><?php endif; ?>
       <a href="index.php" class="nav-item" target="_blank">⏱ Pointage</a>
     </nav>
@@ -183,7 +281,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
 
   <main class="main">
     <div class="topbar">
-      <h2><?= $tab==='pointages'?'Tableau de bord':($tab==='employes'?'Employés':'Sous-admins') ?></h2>
+      <h2><?= $tab==='pointages'?'Tableau de bord':($tab==='employes'?'Employés':($tab==='otp'?'OTP fallback':'Sous-admins')) ?></h2>
       <div class="abadge">👤 <?= htmlspecialchars($_SESSION['admin_name']) ?></div>
     </div>
 
@@ -199,6 +297,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
     <div class="tabs">
       <a href="admin.php?tab=pointages" class="tb <?= $tab==='pointages'?'active':'' ?>">📋 Pointages</a>
       <a href="admin.php?tab=employes"  class="tb <?= $tab==='employes' ?'active':'' ?>">👥 Employés</a>
+      <a href="admin.php?tab=otp" class="tb <?= $tab==='otp'?'active':'' ?>">🔐 OTP fallback</a>
       <?php if($role==='superadmin'): ?><a href="admin.php?tab=subadmins" class="tb <?= $tab==='subadmins'?'active':'' ?>">🔑 Sous-admins</a><?php endif; ?>
     </div>
 
@@ -227,7 +326,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
         <div class="vide">Aucun pointage trouvé.</div>
       <?php else: ?>
       <table>
-        <thead><tr><th>Employé</th><th>Code</th><th>Poste</th><th>Type</th><th>Heure</th><th>Date</th><th>GPS</th></tr></thead>
+        <thead><tr><th>Employé</th><th>Code</th><th>Poste</th><th>Type</th><th>Heure</th><th>Date</th><th>Vérification</th><th>GPS</th></tr></thead>
         <tbody>
           <?php foreach($pointages as $p): ?>
           <tr>
@@ -237,7 +336,55 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
             <td><span class="badge <?= $p['type'] ?>"><?= $p['type']==='arrivee'?'🟢 Arrivée':'🔴 Départ' ?></span></td>
             <td><?= date('H:i',strtotime($p['heure'])) ?></td>
             <td><?= date('d/m/Y',strtotime($p['date_pointage'])) ?></td>
+            <td><?= ($p['verification_method'] ?? 'webauthn') === 'otp_fallback' ? 'OTP manager' : 'Empreinte' ?></td>
             <td><?php if($p['latitude']&&$p['longitude']): ?><a class="glink" href="https://maps.google.com/?q=<?= $p['latitude'] ?>,<?= $p['longitude'] ?>" target="_blank">📍</a><?php else: ?>—<?php endif; ?></td>
+          </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+      <?php endif; ?>
+    </div>
+
+    <?php elseif($tab==='otp'): ?>
+    <?php if(isset($_GET['msg']) && $_GET['msg']==='otp_schema_missing'): ?><div class="er">La table OTP n'existe pas encore. Importez la dernière mise à jour SQL.</div><?php endif; ?>
+    <?php if($otpFlash): ?><div class="ok">✓ <?= htmlspecialchars($otpFlash) ?></div><?php endif; ?>
+    <div class="panel">
+      <div class="ph"><h3>Demandes OTP en attente / approuvées</h3></div>
+      <?php if(!$otpTableReady): ?><div class="vide">Module OTP inactif: importez la dernière version de la base de données.</div>
+      <?php elseif(empty($otp_requests)): ?><div class="vide">Aucune demande OTP.</div>
+      <?php else: ?>
+      <table>
+        <thead><tr><th>#</th><th>Employé</th><th>Type</th><th>Demandé le</th><th>Raison</th><th>GPS</th><th>Statut</th><th>Action</th></tr></thead>
+        <tbody>
+          <?php foreach($otp_requests as $r): ?>
+          <tr>
+            <td><strong><?= (int)$r['id'] ?></strong></td>
+            <td><?= htmlspecialchars($r['prenom'].' '.$r['nom']) ?> <span style="color:#888">(<?= htmlspecialchars($r['code_employe']) ?>)</span></td>
+            <td><?= $r['type']==='arrivee'?'🟢 Arrivée':'🔴 Départ' ?></td>
+            <td><?= date('d/m H:i', strtotime($r['requested_at'])) ?></td>
+            <td style="max-width:210px"><?= htmlspecialchars($r['request_reason'] ?: '—') ?></td>
+            <td><?php if($r['requested_latitude']&&$r['requested_longitude']): ?><a class="glink" href="https://maps.google.com/?q=<?= $r['requested_latitude'] ?>,<?= $r['requested_longitude'] ?>" target="_blank">📍</a><?php else: ?>—<?php endif; ?></td>
+            <td><strong><?= htmlspecialchars($r['status']) ?></strong></td>
+            <td>
+              <?php if($r['status']==='pending'): ?>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                <form method="POST" style="display:inline">
+                  <input type="hidden" name="action" value="approve_otp_request"/>
+                  <input type="hidden" name="id" value="<?= (int)$r['id'] ?>"/>
+                  <input type="hidden" name="decision_note" value="Approuvé par manager"/>
+                  <button type="submit" class="btn bg" style="padding:6px 10px">Approuver</button>
+                </form>
+                <form method="POST" style="display:inline">
+                  <input type="hidden" name="action" value="reject_otp_request"/>
+                  <input type="hidden" name="id" value="<?= (int)$r['id'] ?>"/>
+                  <input type="hidden" name="decision_note" value="Rejeté par manager"/>
+                  <button type="submit" class="btn" style="padding:6px 10px;background:#E24B4A;color:#fff">Rejeter</button>
+                </form>
+              </div>
+              <?php elseif($r['status']==='approved'): ?>
+                <span style="color:#1D9E75;font-size:12px">OTP émis, en attente d'utilisation</span>
+              <?php endif; ?>
+            </td>
           </tr>
           <?php endforeach; ?>
         </tbody>
