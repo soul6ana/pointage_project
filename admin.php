@@ -340,7 +340,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
 <body>
 <div class="layout">
   <aside class="sidebar">
-    <div class="brand">⏱ Point<span>age</span></div>
+    <div class="brand">⏱ Point<span>age.</span></div>
     <div class="role-badge"><?= $role==='superadmin'?'👑 Super Admin':'🔵 Sous Admin' ?></div>
     <nav>
       <a href="admin.php?tab=pointages" class="nav-item <?= $tab==='pointages'?'active':'' ?>">📋 Pointages</a>
