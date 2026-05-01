@@ -17,6 +17,13 @@ try {
   $otpTableReady = false;
 }
 
+$auditTableReady = false;
+try {
+  $auditTableReady = (bool)$pdo->query("SHOW TABLES LIKE 'audit_logs'")->fetchColumn();
+} catch (Throwable $e) {
+  $auditTableReady = false;
+}
+
 // ===== ACTIONS =====
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 
@@ -54,6 +61,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             $pdo->prepare("UPDATE employes SET actif=0 WHERE id=? AND created_by_admin=?")->execute([$id, $admin_id]);
         }
         header('Location: admin.php?tab=employes&msg=supprime'); exit;
+    }
+
+    // Réinitialiser liaison appareil
+    if ($_POST['action'] === 'reset_device_binding') {
+      $id = (int)$_POST['id'];
+
+      if ($role === 'superadmin') {
+        $sel = $pdo->prepare("SELECT id, code_employe, nom, prenom FROM employes WHERE id=? AND actif=1");
+        $sel->execute([$id]);
+      } else {
+        $sel = $pdo->prepare("SELECT id, code_employe, nom, prenom FROM employes WHERE id=? AND actif=1 AND created_by_admin=?");
+        $sel->execute([$id, $admin_id]);
+      }
+      $targetEmploye = $sel->fetch(PDO::FETCH_ASSOC);
+
+      if (!$targetEmploye) {
+        header('Location: admin.php?tab=employes&msg=device_reset_denied'); exit;
+      }
+
+      if ($role === 'superadmin') {
+        $pdo->prepare("UPDATE employes SET webauthn_credential_id=NULL, webauthn_credential=NULL WHERE id=?")->execute([$id]);
+      } else {
+        $pdo->prepare("UPDATE employes SET webauthn_credential_id=NULL, webauthn_credential=NULL WHERE id=? AND created_by_admin=?")
+          ->execute([$id, $admin_id]);
+      }
+
+      if ($auditTableReady) {
+        $details = sprintf(
+          'Reset liaison appareil pour %s %s (%s)',
+          $targetEmploye['prenom'],
+          $targetEmploye['nom'],
+          $targetEmploye['code_employe']
+        );
+        $ip = $_SERVER['REMOTE_ADDR'] ?? null;
+        $ua = $_SERVER['HTTP_USER_AGENT'] ?? null;
+        $pdo->prepare(
+          "INSERT INTO audit_logs (admin_id, employe_id, action, details, ip_address, user_agent) VALUES (?,?,?,?,?,?)"
+        )->execute([$admin_id, $targetEmploye['id'], 'device_binding_reset', $details, $ip, $ua]);
+      }
+
+      header('Location: admin.php?tab=employes&msg=device_reset'); exit;
     }
 
     // Approuver demande OTP fallback
@@ -161,6 +209,30 @@ if ($otpTableReady && $role === 'superadmin') {
   $otp_requests = $sOtp->fetchAll(PDO::FETCH_ASSOC);
 }
 
+$audit_logs = [];
+if ($auditTableReady && $role === 'superadmin') {
+  $audit_logs = $pdo->query(
+    "SELECT l.*, a.username AS admin_username, e.code_employe, e.nom, e.prenom
+     FROM audit_logs l
+     LEFT JOIN admins a ON a.id = l.admin_id
+     LEFT JOIN employes e ON e.id = l.employe_id
+     ORDER BY l.created_at DESC, l.id DESC
+     LIMIT 200"
+  )->fetchAll(PDO::FETCH_ASSOC);
+} elseif ($auditTableReady) {
+  $sAudit = $pdo->prepare(
+    "SELECT l.*, a.username AS admin_username, e.code_employe, e.nom, e.prenom
+     FROM audit_logs l
+     LEFT JOIN admins a ON a.id = l.admin_id
+     LEFT JOIN employes e ON e.id = l.employe_id
+     WHERE l.admin_id = ?
+     ORDER BY l.created_at DESC, l.id DESC
+     LIMIT 200"
+  );
+  $sAudit->execute([$admin_id]);
+  $audit_logs = $sAudit->fetchAll(PDO::FETCH_ASSOC);
+}
+
 // Filtres
 $filtre_date = $_GET['date']    ?? date('Y-m-d');
 $filtre_emp  = $_GET['employe'] ?? '';
@@ -260,6 +332,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
     .ok{background:#e1f5ee;color:#0F6E56;padding:9px 14px;border-radius:8px;font-size:13px;margin-bottom:12px}
     .er{background:#fcebeb;color:#A32D2D;padding:9px 14px;border-radius:8px;font-size:13px;margin-bottom:12px}
     .bdel{background:none;border:none;color:#E24B4A;cursor:pointer;font-size:17px;padding:0 4px}
+    .breset{background:none;border:none;color:#378ADD;cursor:pointer;font-size:17px;padding:0 4px}
     .vide{text-align:center;padding:36px;color:#aaa;font-size:14px}
     @media(max-width:900px){.sidebar{display:none}.main{margin-left:0;padding:14px}.stats{grid-template-columns:1fr 1fr}.fg{grid-template-columns:1fr}}
   </style>
@@ -273,6 +346,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
       <a href="admin.php?tab=pointages" class="nav-item <?= $tab==='pointages'?'active':'' ?>">📋 Pointages</a>
       <a href="admin.php?tab=employes"  class="nav-item <?= $tab==='employes' ?'active':'' ?>">👥 Employés</a>
       <a href="admin.php?tab=otp" class="nav-item <?= $tab==='otp'?'active':'' ?>">🔐 OTP fallback</a>
+      <a href="admin.php?tab=audit" class="nav-item <?= $tab==='audit'?'active':'' ?>">🧾 Audit</a>
       <?php if($role==='superadmin'): ?><a href="admin.php?tab=subadmins" class="nav-item <?= $tab==='subadmins'?'active':'' ?>">🔑 Sous-admins</a><?php endif; ?>
       <a href="index.php" class="nav-item" target="_blank">⏱ Pointage</a>
     </nav>
@@ -281,7 +355,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
 
   <main class="main">
     <div class="topbar">
-      <h2><?= $tab==='pointages'?'Tableau de bord':($tab==='employes'?'Employés':($tab==='otp'?'OTP fallback':'Sous-admins')) ?></h2>
+      <h2><?= $tab==='pointages'?'Tableau de bord':($tab==='employes'?'Employés':($tab==='otp'?'OTP fallback':($tab==='audit'?'Journal audit':'Sous-admins'))) ?></h2>
       <div class="abadge">👤 <?= htmlspecialchars($_SESSION['admin_name']) ?></div>
     </div>
 
@@ -298,6 +372,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
       <a href="admin.php?tab=pointages" class="tb <?= $tab==='pointages'?'active':'' ?>">📋 Pointages</a>
       <a href="admin.php?tab=employes"  class="tb <?= $tab==='employes' ?'active':'' ?>">👥 Employés</a>
       <a href="admin.php?tab=otp" class="tb <?= $tab==='otp'?'active':'' ?>">🔐 OTP fallback</a>
+      <a href="admin.php?tab=audit" class="tb <?= $tab==='audit'?'active':'' ?>">🧾 Audit</a>
       <?php if($role==='superadmin'): ?><a href="admin.php?tab=subadmins" class="tb <?= $tab==='subadmins'?'active':'' ?>">🔑 Sous-admins</a><?php endif; ?>
     </div>
 
@@ -336,7 +411,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
             <td><span class="badge <?= $p['type'] ?>"><?= $p['type']==='arrivee'?'🟢 Arrivée':'🔴 Départ' ?></span></td>
             <td><?= date('H:i',strtotime($p['heure'])) ?></td>
             <td><?= date('d/m/Y',strtotime($p['date_pointage'])) ?></td>
-            <td><?= ($p['verification_method'] ?? 'webauthn') === 'otp_fallback' ? 'OTP manager' : 'Empreinte' ?></td>
+                      <td><?= ($p['verification_method'] ?? 'webauthn') === 'otp_fallback' ? 'OTP manager' : 'Appareil lié' ?></td>
             <td><?php if($p['latitude']&&$p['longitude']): ?><a class="glink" href="https://maps.google.com/?q=<?= $p['latitude'] ?>,<?= $p['longitude'] ?>" target="_blank">📍</a><?php else: ?>—<?php endif; ?></td>
           </tr>
           <?php endforeach; ?>
@@ -393,7 +468,9 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
     </div>
 
     <?php elseif($tab==='employes'): ?>
-    <?php if(isset($_GET['msg'])): ?><div class="ok">✓ Action effectuée.</div><?php endif; ?>
+    <?php if(isset($_GET['msg'])): ?>
+      <div class="ok">✓ <?= $_GET['msg']==='device_reset' ? 'Liaison appareil réinitialisée.' : ($_GET['msg']==='device_reset_denied' ? 'Action refusée (employé non autorisé).' : 'Action effectuée.') ?></div>
+    <?php endif; ?>
     <?php if(isset($erreur_emp)): ?><div class="er"><?= htmlspecialchars($erreur_emp) ?></div><?php endif; ?>
     <div class="panel">
       <div class="ph"><h3>Ajouter un employé</h3></div>
@@ -415,7 +492,7 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
       <?php if(empty($employes)): ?><div class="vide">Aucun employé.</div>
       <?php else: ?>
       <table>
-        <thead><tr><th>Code</th><th>Nom</th><th>Poste</th><th>Email</th><?php if($role==='superadmin'): ?><th>Sous-admin</th><?php endif; ?><th></th></tr></thead>
+        <thead><tr><th>Code</th><th>Nom</th><th>Poste</th><th>Email</th><th>Appareil</th><?php if($role==='superadmin'): ?><th>Sous-admin</th><?php endif; ?><th>Actions</th></tr></thead>
         <tbody>
           <?php foreach($employes as $e): ?>
           <tr>
@@ -423,14 +500,49 @@ $nb_absents = max(0, $nb_total - $nb_arrives);
             <td><?= htmlspecialchars($e['prenom'].' '.$e['nom']) ?></td>
             <td><?= htmlspecialchars($e['poste']??'—') ?></td>
             <td style="color:#888;font-size:12px"><?= htmlspecialchars($e['email']??'—') ?></td>
+            <td><?= !empty($e['webauthn_credential_id']) ? '<span class="badge sub">Lié</span>' : '<span style="color:#888">Non lié</span>' ?></td>
             <?php if($role==='superadmin'): ?><td style="color:#888;font-size:12px"><?= htmlspecialchars($e['admin_nom']??'—') ?></td><?php endif; ?>
             <td>
+              <form method="POST" style="display:inline" onsubmit="return confirm('Réinitialiser la liaison appareil de cet employé ?')">
+                <input type="hidden" name="action" value="reset_device_binding"/>
+                <input type="hidden" name="id" value="<?= $e['id'] ?>"/>
+                <button type="submit" class="breset" title="Réinitialiser appareil">🔁</button>
+              </form>
               <form method="POST" style="display:inline" onsubmit="return confirm('Désactiver ?')">
                 <input type="hidden" name="action" value="supprimer_employe"/>
                 <input type="hidden" name="id" value="<?= $e['id'] ?>"/>
                 <button type="submit" class="bdel">✕</button>
               </form>
             </td>
+          </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+      <?php endif; ?>
+    </div>
+
+    <?php elseif($tab==='audit'): ?>
+    <div class="panel">
+      <div class="ph"><h3>Journal des actions sensibles</h3></div>
+      <?php if(!$auditTableReady): ?><div class="vide">Journal audit inactif: importez la migration audit_logs.</div>
+      <?php elseif(empty($audit_logs)): ?><div class="vide">Aucune entrée audit.</div>
+      <?php else: ?>
+      <table>
+        <thead><tr><th>Date</th><th>Admin</th><th>Action</th><th>Employé</th><th>Détails</th><th>IP</th></tr></thead>
+        <tbody>
+          <?php foreach($audit_logs as $l): ?>
+          <tr>
+            <td><?= date('d/m/Y H:i', strtotime($l['created_at'])) ?></td>
+            <td><?= htmlspecialchars($l['admin_username'] ?? ('#'.$l['admin_id'])) ?></td>
+            <td><?= htmlspecialchars($l['action']) ?></td>
+            <td>
+              <?php if(!empty($l['employe_id'])): ?>
+                <?= htmlspecialchars(($l['prenom'] ?? '').' '.($l['nom'] ?? '')) ?>
+                <span style="color:#888">(<?= htmlspecialchars($l['code_employe'] ?? '#'.$l['employe_id']) ?>)</span>
+              <?php else: ?>—<?php endif; ?>
+            </td>
+            <td style="max-width:340px"><?= htmlspecialchars($l['details'] ?? '—') ?></td>
+            <td><?= htmlspecialchars($l['ip_address'] ?? '—') ?></td>
           </tr>
           <?php endforeach; ?>
         </tbody>

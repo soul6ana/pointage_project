@@ -1,5 +1,5 @@
 <?php
-// index.php - Page de pointage avec empreinte digitale
+// index.php - Page de pointage avec liaison d'appareil
 session_start();
 require_once 'config.php';
 
@@ -29,6 +29,9 @@ function validate_geofence($latitude, $longitude, ?float &$distance = null): boo
   $lat = (float)$latitude;
   $lng = (float)$longitude;
   $distance = employee_distance_meters($lat, $lng);
+  if (!ENFORCE_GEOFENCE) {
+    return true;
+  }
   return $distance <= GEOFENCE_RADIUS_METERS;
 }
 
@@ -79,6 +82,78 @@ function insert_pointage(PDO $pdo, array $payload): void {
   }
 }
 
+function get_today_pointage_state(PDO $pdo, int $employeId, string $datePointage): array {
+  $hasArrivee = false;
+  $hasDepart = false;
+
+  $st = $pdo->prepare("SELECT type FROM pointages WHERE employe_id = ? AND date_pointage = ?");
+  $st->execute([$employeId, $datePointage]);
+  foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $t) {
+    if ($t === 'arrivee') {
+      $hasArrivee = true;
+    }
+    if ($t === 'depart') {
+      $hasDepart = true;
+    }
+  }
+
+  return [
+    'has_arrivee' => $hasArrivee,
+    'has_depart' => $hasDepart,
+    'can_arrivee' => !$hasArrivee,
+    'can_depart' => $hasArrivee && !$hasDepart,
+  ];
+}
+
+function bind_or_validate_device(PDO $pdo, array $employe, string $deviceFingerprint, bool $bindIfMissing = false): array {
+  if ($deviceFingerprint === '') {
+    return ['ok' => false, 'bound_now' => false, 'message' => 'Identifiant appareil manquant. Rechargez la page puis réessayez.'];
+  }
+
+  $saved = trim((string)($employe['webauthn_credential_id'] ?? ''));
+
+  // Legacy WebAuthn values are not SHA-256 hex fingerprints; replace once during first device-binding check.
+  if ($saved !== '' && !preg_match('/^[a-f0-9]{64}$/', $saved)) {
+    $meta = json_encode([
+      'bound_at' => (new DateTime())->format('Y-m-d H:i:s'),
+      'ua' => $_SERVER['HTTP_USER_AGENT'] ?? 'unknown',
+      'migrated_from_legacy' => true
+    ]);
+    $pdo->prepare("UPDATE employes SET webauthn_credential_id = ?, webauthn_credential = ? WHERE id = ?")
+        ->execute([$deviceFingerprint, $meta, $employe['id']]);
+    return ['ok' => true, 'bound_now' => true, 'message' => ''];
+  }
+
+  if ($saved !== '') {
+    if (!hash_equals($saved, $deviceFingerprint)) {
+      return [
+        'ok' => false,
+        'bound_now' => false,
+        'message' => '🔒 Ce compte est lié à un autre téléphone. Utilisez l\'appareil déjà enregistré ou contactez votre manager.'
+      ];
+    }
+    return ['ok' => true, 'bound_now' => false, 'message' => ''];
+  }
+
+  if (!$bindIfMissing) {
+    return [
+      'ok' => false,
+      'bound_now' => false,
+      'message' => 'Appareil non enregistré. Vérifiez votre code employé pour lier ce téléphone.'
+    ];
+  }
+
+  $meta = json_encode([
+    'bound_at' => (new DateTime())->format('Y-m-d H:i:s'),
+    'ua' => $_SERVER['HTTP_USER_AGENT'] ?? 'unknown'
+  ]);
+
+  $pdo->prepare("UPDATE employes SET webauthn_credential_id = ?, webauthn_credential = ? WHERE id = ?")
+      ->execute([$deviceFingerprint, $meta, $employe['id']]);
+
+  return ['ok' => true, 'bound_now' => true, 'message' => ''];
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action       = $_POST['action'] ?? '';
     $code_employe = trim($_POST['code_employe'] ?? '');
@@ -86,182 +161,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $latitude     = $_POST['latitude'] ?? null;
     $longitude    = $_POST['longitude'] ?? null;
     $adresse      = trim($_POST['adresse'] ?? '');
+    $device_fingerprint = trim($_POST['device_fingerprint'] ?? '');
 
-    // --- Enregistrer l'empreinte (première fois) ---
-    if ($action === 'register_credential') {
-        $credential_id   = $_POST['credential_id']     ?? '';
-        $attestation_b64 = $_POST['attestation_object'] ?? ''; // full attestationObject
-        $client_data_b64 = $_POST['client_data_json']   ?? ''; // clientDataJSON
-
-        if (empty($code_employe) || empty($credential_id)) {
-          json_response(['success' => false, 'message' => 'Données manquantes.']);
-        }
-
-        // --- Verify registration challenge ---
-        if (!empty($client_data_b64)) {
-          if (empty($_SESSION['webauthn_reg_challenge'])
-              || (time() - ($_SESSION['webauthn_reg_challenge_ts'] ?? 0)) > 300) {
-            unset($_SESSION['webauthn_reg_challenge'],
-                  $_SESSION['webauthn_reg_challenge_uid'],
-                  $_SESSION['webauthn_reg_challenge_ts']);
-            json_response(['success' => false, 'message' => 'Challenge d\'enregistrement expiré. Rechargez la page.']);
-          }
-
-          $cdj      = base64_decode(strtr($client_data_b64, '-_', '+/'));
-          $cdParsed = json_decode($cdj, true);
-
-          if (is_array($cdParsed) && ($cdParsed['type'] ?? '') === 'webauthn.create') {
-            $expB64 = rtrim(strtr(base64_encode(hex2bin($_SESSION['webauthn_reg_challenge'])), '+/', '-_'), '=');
-            $rcv    = rtrim(strtr($cdParsed['challenge'] ?? '', '+/', '-_'), '=');
-            if (!hash_equals($expB64, $rcv)) {
-              unset($_SESSION['webauthn_reg_challenge'],
-                    $_SESSION['webauthn_reg_challenge_uid'],
-                    $_SESSION['webauthn_reg_challenge_ts']);
-              json_response(['success' => false, 'message' => 'Challenge d\'enregistrement invalide.']);
-            }
-            $proto           = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-            $expected_origin = $proto . '://' . $_SERVER['HTTP_HOST'];
-            if (($cdParsed['origin'] ?? '') !== $expected_origin) {
-              json_response(['success' => false, 'message' => 'Origine invalide lors de l\'enregistrement.']);
-            }
-          }
-          unset($_SESSION['webauthn_reg_challenge'],
-                $_SESSION['webauthn_reg_challenge_uid'],
-                $_SESSION['webauthn_reg_challenge_ts']);
-        }
-
-        $stmt = $pdo->prepare("SELECT * FROM employes WHERE code_employe = ? AND actif = 1");
-        $stmt->execute([$code_employe]);
-        $employe = $stmt->fetch(PDO::FETCH_ASSOC);
-
-        if (!$employe) {
-          json_response(['success' => false, 'message' => 'Code employé introuvable.']);
-        }
-
-        $pdo->prepare("UPDATE employes SET webauthn_credential_id = ?, webauthn_credential = ? WHERE code_employe = ?")
-            ->execute([$credential_id, (!empty($attestation_b64) ? $attestation_b64 : $credential_id), $code_employe]);
-
-        json_response(['success' => true, 'message' => 'Empreinte enregistrée avec succès !']);
-    }
-
-    // --- Vérifier si employé a une empreinte enregistrée ---
+    // --- Vérifier code employé + binding appareil ---
     if ($action === 'check_credential') {
         if (empty($code_employe)) {
-          json_response(['success' => false, 'has_credential' => false]);
+          json_response(['success' => false, 'message' => 'Code employé requis.']);
         }
-        $stmt = $pdo->prepare("SELECT id, webauthn_credential_id, webauthn_credential, nom, prenom FROM employes WHERE code_employe = ? AND actif = 1");
+
+        $stmt = $pdo->prepare("SELECT id, webauthn_credential_id, nom, prenom FROM employes WHERE code_employe = ? AND actif = 1");
         $stmt->execute([$code_employe]);
         $employe = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if (!$employe) {
-          json_response(['success' => false, 'has_credential' => false, 'message' => 'Code introuvable.']);
+          json_response(['success' => false, 'message' => 'Code introuvable.']);
         }
 
-        if ($employe['webauthn_credential_id']) {
-            // Generate server-side authentication challenge (prevents direct-POST bypass)
-            $cBytes = random_bytes(32);
-            $cB64   = rtrim(strtr(base64_encode($cBytes), '+/', '-_'), '=');
-            $_SESSION['webauthn_auth_challenge']     = bin2hex($cBytes);
-            $_SESSION['webauthn_auth_challenge_uid'] = (int)$employe['id'];
-            $_SESSION['webauthn_auth_challenge_ts']  = time();
-            json_response([
-                'success'        => true,
-                'has_credential' => true,
-                'credential_id'  => $employe['webauthn_credential_id'],
-                'nom'            => $employe['prenom'] . ' ' . $employe['nom'],
-                'challenge'      => $cB64
-            ]);
-        } else {
-            // Generate server-side registration challenge
-            $cBytes = random_bytes(32);
-            $cB64   = rtrim(strtr(base64_encode($cBytes), '+/', '-_'), '=');
-            $_SESSION['webauthn_reg_challenge']     = bin2hex($cBytes);
-            $_SESSION['webauthn_reg_challenge_uid'] = (int)$employe['id'];
-            $_SESSION['webauthn_reg_challenge_ts']  = time();
-            json_response([
-                'success'        => true,
-                'has_credential' => false,
-                'nom'            => $employe['prenom'] . ' ' . $employe['nom'],
-                'reg_challenge'  => $cB64
-            ]);
-        }
+        $deviceCheck = bind_or_validate_device($pdo, $employe, $device_fingerprint, true);
+        if (!$deviceCheck['ok']) {
+          json_response(['success' => false, 'message' => $deviceCheck['message']]);
         }
 
-        // --- Vérifier l'assertion WebAuthn côté serveur ---
-        if ($action === 'verify_assertion') {
-          $cdj_b64  = $_POST['client_data_json'] ?? '';
-          $cred_rcvd = $_POST['credential_id']   ?? '';
+        $todayState = get_today_pointage_state($pdo, (int)$employe['id'], (new DateTime())->format('Y-m-d'));
 
-          if (empty($code_employe) || empty($cdj_b64)) {
-            json_response(['success' => false, 'message' => 'Données manquantes.']);
-          }
-
-          // Challenge must exist and be fresh (≤5 min)
-          if (empty($_SESSION['webauthn_auth_challenge'])
-              || (time() - ($_SESSION['webauthn_auth_challenge_ts'] ?? 0)) > 300) {
-            unset($_SESSION['webauthn_auth_challenge'],
-                  $_SESSION['webauthn_auth_challenge_uid'],
-                  $_SESSION['webauthn_auth_challenge_ts']);
-            json_response(['success' => false, 'message' => 'Challenge expiré. Revérifiez votre code employé.']);
-          }
-
-          // Decode and parse clientDataJSON
-          $cdj    = base64_decode(strtr($cdj_b64, '-_', '+/'));
-          $cdData = json_decode($cdj, true);
-
-          if (!is_array($cdData)) {
-            json_response(['success' => false, 'message' => 'ClientDataJSON invalide.']);
-          }
-
-          // Verify type
-          if (($cdData['type'] ?? '') !== 'webauthn.get') {
-            json_response(['success' => false, 'message' => 'Type WebAuthn invalide.']);
-          }
-
-          // Verify challenge
-          $expB64 = rtrim(strtr(base64_encode(hex2bin($_SESSION['webauthn_auth_challenge'])), '+/', '-_'), '=');
-          $rcv    = rtrim(strtr($cdData['challenge'] ?? '', '+/', '-_'), '=');
-          if (!hash_equals($expB64, $rcv)) {
-            json_response(['success' => false, 'message' => 'Challenge WebAuthn invalide. Recommencez.']);
-          }
-
-          // Verify origin
-          $proto           = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-          $expected_origin = $proto . '://' . $_SERVER['HTTP_HOST'];
-          if (($cdData['origin'] ?? '') !== $expected_origin) {
-            json_response(['success' => false, 'message' => 'Origine invalide.']);
-          }
-
-          // Look up employee; verify it is the same employee the challenge was issued for
-          $stmt = $pdo->prepare("SELECT id, webauthn_credential_id FROM employes WHERE code_employe = ? AND actif = 1");
-          $stmt->execute([$code_employe]);
-          $employe = $stmt->fetch(PDO::FETCH_ASSOC);
-
-          if (!$employe || (int)$employe['id'] !== (int)$_SESSION['webauthn_auth_challenge_uid']) {
-            json_response(['success' => false, 'message' => 'Employé invalide pour ce challenge.']);
-          }
-
-          // Credential ID sent by client must match registered one
-          if (!empty($cred_rcvd) && !empty($employe['webauthn_credential_id'])) {
-            if (!hash_equals($employe['webauthn_credential_id'], $cred_rcvd)) {
-              json_response(['success' => false, 'message' => 'Credential invalide.']);
-            }
-          }
-
-          // Consume challenge (one-time use)
-          $uid = (int)$employe['id'];
-          unset($_SESSION['webauthn_auth_challenge'],
-                $_SESSION['webauthn_auth_challenge_uid'],
-                $_SESSION['webauthn_auth_challenge_ts']);
-
-          // Grant short-lived assertion session token (2 min, one-use)
-          $_SESSION['webauthn_assertion'] = [
-            'employe_id' => $uid,
-            'expires_at' => time() + 120,
-          ];
-
-          json_response(['success' => true]);
-        }
+        json_response([
+          'success' => true,
+          'nom' => $employe['prenom'] . ' ' . $employe['nom'],
+          'device_bound_now' => $deviceCheck['bound_now'],
+          'has_arrivee' => $todayState['has_arrivee'],
+          'has_depart' => $todayState['has_depart'],
+          'can_arrivee' => $todayState['can_arrivee'],
+          'can_depart' => $todayState['can_depart']
+        ]);
+    }
 
         // --- Demande OTP fallback (à approuver par manager) ---
         if ($action === 'request_otp_fallback') {
@@ -278,7 +210,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           if (!validate_geofence($latitude, $longitude, $distance)) {
             json_response([
               'success' => false,
-              'message' => '❌ Hors zone autorisée. Rapprochez-vous du site pour demander un OTP.'
+              'message' => '❌ Localisation requise. Activez votre GPS puis réessayez.'
             ]);
           }
 
@@ -290,7 +222,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             json_response(['success' => false, 'message' => 'Code employé introuvable.']);
           }
 
+          $deviceCheck = bind_or_validate_device($pdo, $employe, $device_fingerprint, false);
+          if (!$deviceCheck['ok']) {
+            json_response(['success' => false, 'message' => $deviceCheck['message']]);
+          }
+
           $today = (new DateTime())->format('Y-m-d');
+          $state = get_today_pointage_state($pdo, (int)$employe['id'], $today);
+          if ($type === 'depart' && !$state['has_arrivee']) {
+            json_response(['success' => false, 'message' => '⚠️ Vous devez pointer votre arrivée avant de demander un OTP départ.', 'warning' => true]);
+          }
           $exists = $pdo->prepare("SELECT id FROM pointages WHERE employe_id = ? AND type = ? AND date_pointage = ?");
           $exists->execute([$employe['id'], $type, $today]);
           if ($exists->fetch()) {
@@ -330,7 +271,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
           $distance = null;
           if (!validate_geofence($latitude, $longitude, $distance)) {
-            json_response(['success' => false, 'message' => '❌ Vous êtes hors zone autorisée.']);
+            json_response(['success' => false, 'message' => '❌ Localisation requise. Activez votre GPS puis réessayez.']);
           }
 
           $stmt = $pdo->prepare("SELECT * FROM employes WHERE code_employe = ? AND actif = 1");
@@ -341,9 +282,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             json_response(['success' => false, 'message' => 'Code employé introuvable.']);
           }
 
+          $deviceCheck = bind_or_validate_device($pdo, $employe, $device_fingerprint, false);
+          if (!$deviceCheck['ok']) {
+            json_response(['success' => false, 'message' => $deviceCheck['message']]);
+          }
+
           $maintenant    = new DateTime();
           $heure         = $maintenant->format('Y-m-d H:i:s');
           $date_pointage = $maintenant->format('Y-m-d');
+
+          $state = get_today_pointage_state($pdo, (int)$employe['id'], $date_pointage);
+          if ($type === 'depart' && !$state['has_arrivee']) {
+            json_response(['success' => false, 'message' => '⚠️ Vous devez pointer votre arrivée avant le départ.', 'warning' => true]);
+          }
 
           $exists = $pdo->prepare("SELECT id FROM pointages WHERE employe_id = ? AND type = ? AND date_pointage = ?");
           $exists->execute([$employe['id'], $type, $date_pointage]);
@@ -387,16 +338,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // --- Pointage ---
     if ($action === 'pointer') {
-          // Require a valid WebAuthn assertion token (set by verify_assertion)
-          $assertTok = $_SESSION['webauthn_assertion'] ?? null;
-          if (!$assertTok || (int)($assertTok['expires_at'] ?? 0) < time()) {
-            unset($_SESSION['webauthn_assertion']);
-            json_response(['success' => false, 'message' => '🔒 Authentification biométrique requise. Posez votre doigt à nouveau.']);
-          }
-
           $distance = null;
           if (!validate_geofence($latitude, $longitude, $distance)) {
-            json_response(['success' => false, 'message' => '❌ Localisation requise dans la zone autorisée.']);
+            json_response(['success' => false, 'message' => '❌ Localisation requise. Activez votre GPS puis réessayez.']);
           }
         if (empty($code_employe) || !in_array($type, ['arrivee', 'depart'])) {
             json_response(['success' => false, 'message' => 'Données invalides.']);
@@ -410,15 +354,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           json_response(['success' => false, 'message' => 'Code employé introuvable.']);
         }
 
-        // Verify assertion token belongs to this employee, then consume it
-        if ((int)$assertTok['employe_id'] !== (int)$employe['id']) {
-          json_response(['success' => false, 'message' => '🔒 Jeton biométrique invalide.']);
+        $deviceCheck = bind_or_validate_device($pdo, $employe, $device_fingerprint, false);
+        if (!$deviceCheck['ok']) {
+          json_response(['success' => false, 'message' => $deviceCheck['message']]);
         }
-        unset($_SESSION['webauthn_assertion']);
 
         $maintenant    = new DateTime();
         $heure         = $maintenant->format('Y-m-d H:i:s');
         $date_pointage = $maintenant->format('Y-m-d');
+
+        $state = get_today_pointage_state($pdo, (int)$employe['id'], $date_pointage);
+        if ($type === 'depart' && !$state['has_arrivee']) {
+          json_response(['success' => false, 'message' => '⚠️ Vous devez pointer votre arrivée avant le départ.', 'warning' => true]);
+        }
 
         $stmt2 = $pdo->prepare("SELECT id FROM pointages WHERE employe_id = ? AND type = ? AND date_pointage = ?");
         $stmt2->execute([$employe['id'], $type, $date_pointage]);
@@ -513,27 +461,42 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     .gps-alerte .texte { font-size: 12px; color: #6d4c0f; line-height: 1.6; }
     .gps-alerte.visible { display: block; }
 
-    /* Enregistrement */
-    .register-box {
-      display: none; background: #e8f4ff; border: 1.5px solid #378ADD;
-      border-radius: 10px; padding: 16px; margin-bottom: 14px; text-align: center;
-    }
-    .register-box p { font-size: 13px; color: #1a5276; margin-bottom: 12px; line-height: 1.5; }
-    .btn-register {
-      padding: 10px 22px; background: #378ADD; color: #fff;
-      border: none; border-radius: 8px; font-size: 14px;
-      font-weight: 600; cursor: pointer;
-    }
-    .register-box.visible { display: block; }
-
-    /* Pointage empreinte */
+    /* Pointage */
     .pointage-box {
       display: none; background: #f7f9fc; border: 1.5px solid #eee;
       border-radius: 12px; padding: 22px; margin-bottom: 14px; text-align: center;
     }
     .pointage-box.visible { display: block; }
     .emp-nom  { font-size: 16px; font-weight: 700; color: #1a1a2e; margin-bottom: 4px; }
-    .emp-sous { font-size: 12px; color: #888; margin-bottom: 20px; }
+    .emp-sous { font-size: 12px; color: #888; margin-bottom: 10px; }
+
+    .day-status {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .state-chip {
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 12px;
+      font-weight: 600;
+      text-align: center;
+      border: 1px solid #e5e8ee;
+      color: #555;
+      background: #fff;
+    }
+    .state-chip.done.arrivee { background: #e1f5ee; border-color: #b9e7d7; color: #0F6E56; }
+    .state-chip.done.depart { background: #fcebeb; border-color: #f6caca; color: #A32D2D; }
+    .flow-hint {
+      margin-bottom: 14px;
+      font-size: 12px;
+      color: #52607a;
+      background: #eef3ff;
+      border: 1px solid #d7e3ff;
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
 
     .fp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     .fp-item { display: flex; flex-direction: column; align-items: center; gap: 8px; }
@@ -570,6 +533,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     .otp-btn.arrivee { background: #1D9E75; }
     .otp-btn.depart { background: #E24B4A; }
+    .otp-btn:disabled { opacity: .45; cursor: not-allowed; }
     .otp-verify { display: flex; gap: 8px; }
     .otp-verify input {
       flex: 1; padding: 9px 10px; border: 1.5px solid #dde3ee; border-radius: 7px;
@@ -590,9 +554,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     .msg-box.warning { background: #faeeda; color: #854F0B; }
     .msg-box.info    { background: #e8f4ff; color: #1a5276; }
     .msg-box.visible { display: block; }
-
-    .admin-link { text-align: center; margin-top: 18px; font-size: 12px; color: #aaa; }
-    .admin-link a { color: #1D9E75; text-decoration: none; }
   </style>
 </head>
 <body>
@@ -634,36 +595,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
   </div>
 
-  <!-- Enregistrement empreinte (1ère fois) -->
-  <div class="register-box" id="register-box">
-    <p>👆 Aucune empreinte enregistrée pour votre compte.<br>
-       Enregistrez votre empreinte digitale pour pouvoir pointer.</p>
-    <button class="btn-register" onclick="enregistrerEmpreinte()">
-      👆 Enregistrer mon empreinte
-    </button>
-  </div>
-
-  <!-- Pointage avec empreinte -->
+  <!-- Pointage -->
   <div class="pointage-box" id="pointage-box">
     <div class="emp-nom" id="emp-nom"></div>
-    <div class="emp-sous">Appuyez sur un bouton et posez votre doigt</div>
+    <div class="emp-sous">Appareil validé. Le flux est guidé automatiquement.</div>
+    <div class="day-status">
+      <div class="state-chip arrivee" id="chip-arrivee">Arrivée non faite</div>
+      <div class="state-chip depart" id="chip-depart">Départ non fait</div>
+    </div>
+    <div class="flow-hint" id="flow-hint">Commencez par Arrivée.</div>
     <div class="fp-grid">
       <div class="fp-item">
         <div class="fp-label" style="color:#1D9E75;">🟢 Arrivée</div>
-        <button class="fp-btn arrivee" id="btn-arrivee" onclick="pointerEmpreinte('arrivee')" disabled>👆</button>
+        <button class="fp-btn arrivee" id="btn-arrivee" onclick="pointerSimple('arrivee')" disabled>✓</button>
       </div>
       <div class="fp-item">
         <div class="fp-label" style="color:#E24B4A;">🔴 Départ</div>
-        <button class="fp-btn depart" id="btn-depart" onclick="pointerEmpreinte('depart')" disabled>👆</button>
+        <button class="fp-btn depart" id="btn-depart" onclick="pointerSimple('depart')" disabled>✓</button>
       </div>
     </div>
 
     <div class="otp-help">
-      <div class="title">Problème biométrique ? OTP avec validation manager</div>
-      <p>Si votre empreinte ne fonctionne pas, demandez un OTP pour Arrivée ou Départ. Votre manager devra valider votre demande.</p>
+      <div class="title">Téléphone refusé ? OTP avec validation manager</div>
+      <p>Si votre téléphone n'est pas reconnu, demandez un OTP pour Arrivée ou Départ. Votre manager devra valider la demande.</p>
       <div class="otp-actions">
-        <button class="otp-btn arrivee" onclick="demanderOtp('arrivee')">Demander OTP Arrivée</button>
-        <button class="otp-btn depart" onclick="demanderOtp('depart')">Demander OTP Départ</button>
+        <button class="otp-btn arrivee" id="otp-arrivee" onclick="demanderOtp('arrivee')">Demander OTP Arrivée</button>
+        <button class="otp-btn depart" id="otp-depart" onclick="demanderOtp('depart')">Demander OTP Départ</button>
       </div>
       <div class="otp-verify">
         <input type="text" id="otp_code" placeholder="Entrer OTP (6 chiffres)" maxlength="6"/>
@@ -678,25 +635,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   <input type="hidden" id="lat"/>
   <input type="hidden" id="lng"/>
   <input type="hidden" id="adresse_field"/>
-
-  <div class="admin-link"><a href="login.php">Accès administrateur →</a></div>
 </div>
 
 <script>
 let otpType = 'arrivee';
-let serverChallenge    = null; // auth challenge (Uint8Array) from check_credential
-let regServerChallenge = null; // registration challenge (Uint8Array)
+let deviceFingerprint = '';
+let dayState = { has_arrivee: false, has_depart: false, can_arrivee: true, can_depart: false };
 
-// ===== BASE64URL HELPERS =====
-function b64urlToBytes(b64url) {
-  const b64 = b64url.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = b64.padEnd(b64.length + (4 - b64.length % 4) % 4, '=');
-  return Uint8Array.from(atob(padded), c => c.charCodeAt(0));
-}
-function bytesToB64url(bytes) {
-  let bin = '';
-  bytes.forEach(b => bin += String.fromCharCode(b));
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+async function buildDeviceFingerprint() {
+  let seed = localStorage.getItem('pointage_device_seed');
+  if (!seed) {
+    seed = (crypto.randomUUID ? crypto.randomUUID() : (Date.now() + '-' + Math.random()));
+    localStorage.setItem('pointage_device_seed', seed);
+  }
+
+  const base = [
+    seed,
+    navigator.userAgent || '',
+    navigator.language || '',
+    navigator.platform || '',
+    String(navigator.hardwareConcurrency || ''),
+    String(navigator.maxTouchPoints || ''),
+    Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+    screen.width + 'x' + screen.height
+  ].join('|');
+
+  if (window.crypto && window.crypto.subtle) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(base));
+    deviceFingerprint = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+  } else {
+    deviceFingerprint = btoa(base).slice(0, 120);
+  }
 }
 
 // ===== HORLOGE =====
@@ -753,25 +722,62 @@ function msg(texte, type) {
   b.className = 'msg-box ' + type + ' visible';
 }
 
+function applyDayState(state) {
+  dayState = {
+    has_arrivee: !!state.has_arrivee,
+    has_depart: !!state.has_depart,
+    can_arrivee: !!state.can_arrivee,
+    can_depart: !!state.can_depart,
+  };
+
+  const btnArrivee = document.getElementById('btn-arrivee');
+  const btnDepart = document.getElementById('btn-depart');
+  const otpArrivee = document.getElementById('otp-arrivee');
+  const otpDepart = document.getElementById('otp-depart');
+  const chipArrivee = document.getElementById('chip-arrivee');
+  const chipDepart = document.getElementById('chip-depart');
+  const flowHint = document.getElementById('flow-hint');
+
+  btnArrivee.disabled = !dayState.can_arrivee;
+  btnDepart.disabled = !dayState.can_depart;
+  otpArrivee.disabled = !dayState.can_arrivee;
+  otpDepart.disabled = !dayState.can_depart;
+
+  chipArrivee.textContent = dayState.has_arrivee ? 'Arrivée validée' : 'Arrivée non faite';
+  chipDepart.textContent = dayState.has_depart ? 'Départ validé' : 'Départ non fait';
+  chipArrivee.className = 'state-chip arrivee' + (dayState.has_arrivee ? ' done' : '');
+  chipDepart.className = 'state-chip depart' + (dayState.has_depart ? ' done' : '');
+
+  if (dayState.has_arrivee && dayState.has_depart) {
+    flowHint.textContent = 'Journée terminée : arrivée et départ déjà enregistrés.';
+  } else if (dayState.can_depart) {
+    flowHint.textContent = 'Arrivée validée. Vous pouvez maintenant pointer le départ.';
+  } else {
+    flowHint.textContent = 'Commencez par Arrivée.';
+  }
+}
+
 async function postAction(formData) {
+  formData.append('device_fingerprint', deviceFingerprint);
   const res = await fetch('', { method: 'POST', body: formData });
   return res.json();
 }
 
 // ===== VÉRIFIER CODE =====
-async function verifierCode() {
+async function verifierCode(silent = false) {
   if (!gpsOk) { msg('⚠️ Activez votre localisation d\'abord.', 'error'); return; }
   const code = document.getElementById('code_employe').value.trim();
   if (!code) { msg('Entrez votre code employé.', 'error'); return; }
 
-  msg('Vérification...', 'info');
+  if (!silent) {
+    msg('Vérification...', 'info');
+  }
   let data;
   try {
     const fd = new FormData();
     fd.append('action', 'check_credential');
     fd.append('code_employe', code);
-    const res = await fetch('', { method: 'POST', body: fd });
-    data = await res.json();
+    data = await postAction(fd);
   } catch (e) {
     msg('Erreur de communication avec le serveur. Réessayez.', 'error');
     console.error(e);
@@ -782,24 +788,20 @@ async function verifierCode() {
 
   document.getElementById('emp-nom').textContent = data.nom;
 
-  if (data.has_credential) {
-    serverChallenge = data.challenge ? b64urlToBytes(data.challenge) : null;
-    document.getElementById('register-box').classList.remove('visible');
-    document.getElementById('pointage-box').classList.add('visible');
-    document.getElementById('btn-arrivee').disabled = false;
-    document.getElementById('btn-depart').disabled  = false;
-    msg('Bonjour ' + data.nom + ' ! Posez votre doigt pour pointer.', 'info');
-  } else {
-    regServerChallenge = data.reg_challenge ? b64urlToBytes(data.reg_challenge) : null;
-    document.getElementById('pointage-box').classList.remove('visible');
-    document.getElementById('register-box').classList.add('visible');
-    msg('Première connexion détectée. Enregistrez votre empreinte.', 'info');
+  document.getElementById('pointage-box').classList.add('visible');
+  applyDayState(data);
+  if (data.device_bound_now) {
+    msg('Téléphone lié avec succès pour ' + data.nom + '.', 'success');
+  } else if (!silent) {
+    msg('Bonjour ' + data.nom + ' ! Téléphone reconnu.', 'info');
   }
 }
 
 // ===== OTP FALLBACK =====
 async function demanderOtp(type) {
   if (!gpsOk) { msg('⚠️ Activez votre localisation pour envoyer une demande OTP.', 'error'); return; }
+  if (type === 'depart' && !dayState.can_depart) { msg('⚠️ Vous devez pointer l\'arrivée avant de demander un OTP départ.', 'warning'); return; }
+  if (type === 'arrivee' && !dayState.can_arrivee) { msg('Arrivée déjà effectuée aujourd\'hui.', 'warning'); return; }
 
   const code = document.getElementById('code_employe').value.trim();
   if (!code) { msg('Entrez votre code employé.', 'error'); return; }
@@ -824,6 +826,8 @@ async function demanderOtp(type) {
 
 async function validerOtp() {
   if (!gpsOk) { msg('⚠️ Activez votre localisation pour valider OTP.', 'error'); return; }
+  if (otpType === 'depart' && !dayState.can_depart) { msg('⚠️ Vous devez pointer l\'arrivée avant le départ.', 'warning'); return; }
+  if (otpType === 'arrivee' && !dayState.can_arrivee) { msg('Arrivée déjà effectuée aujourd\'hui.', 'warning'); return; }
 
   const code = document.getElementById('code_employe').value.trim();
   const otp = document.getElementById('otp_code').value.trim();
@@ -843,119 +847,37 @@ async function validerOtp() {
   msg(data.message, data.success ? 'success' : (data.warning ? 'warning' : 'error'));
   if (data.success) {
     document.getElementById('otp_code').value = '';
+    await verifierCode(true);
   }
 }
 
-// ===== ENREGISTRER EMPREINTE =====
-async function enregistrerEmpreinte() {
-  if (!window.PublicKeyCredential) {
-    msg('Biométrie non supportée. Utilisez Chrome ou Safari sur téléphone.', 'error'); return;
-  }
-  const code = document.getElementById('code_employe').value.trim();
-  if (!regServerChallenge) {
-    msg('⚠️ Rechargez votre code employé avant d\'enregistrer.', 'error'); return;
-  }
-  try {
-    msg('👆 Posez votre doigt sur le capteur...', 'info');
-    const cred = await navigator.credentials.create({
-      publicKey: {
-        challenge: regServerChallenge,
-        rp: { name: "Pointage" },
-        user: { id: new TextEncoder().encode(code), name: code, displayName: code },
-        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-        authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
-        timeout: 60000
-      }
-    });
-
-    const credId         = bytesToB64url(new Uint8Array(cred.rawId));
-    const clientDataJSON = bytesToB64url(new Uint8Array(cred.response.clientDataJSON));
-    const attestation    = bytesToB64url(new Uint8Array(cred.response.attestationObject));
-
-    const fd = new FormData();
-    fd.append('action',           'register_credential');
-    fd.append('code_employe',     code);
-    fd.append('credential_id',    credId);
-    fd.append('client_data_json', clientDataJSON);
-    fd.append('attestation_object', attestation);
-
-    const res  = await fetch('', { method: 'POST', body: fd });
-    const data = await res.json();
-
-    if (data.success) {
-      regServerChallenge = null;
-      msg('✅ Empreinte enregistrée ! Vérification en cours...', 'info');
-      // Re-check to get a fresh auth challenge so the employee can punch immediately
-      const fd2 = new FormData();
-      fd2.append('action', 'check_credential');
-      fd2.append('code_employe', code);
-      const res2  = await fetch('', { method: 'POST', body: fd2 });
-      const data2 = await res2.json();
-      if (data2.success && data2.has_credential && data2.challenge) {
-        serverChallenge = b64urlToBytes(data2.challenge);
-      }
-      document.getElementById('register-box').classList.remove('visible');
-      document.getElementById('pointage-box').classList.add('visible');
-      document.getElementById('btn-arrivee').disabled = false;
-      document.getElementById('btn-depart').disabled  = false;
-      msg('✅ Empreinte enregistrée ! Vous pouvez maintenant pointer.', 'success');
-    } else {
-      msg(data.message, 'error');
-    }
-  } catch (e) {
-    msg(e.name === 'NotAllowedError' ? '❌ Empreinte refusée. Réessayez.' : '❌ Erreur : ' + e.message, 'error');
-  }
-}
-// ===== POINTER AVEC EMPREINTE =====
-async function pointerEmpreinte(type) {
+// ===== POINTER =====
+async function pointerSimple(type) {
   if (!gpsOk) { msg('⚠️ Activez votre localisation pour pointer.', 'error'); return; }
-  if (!window.PublicKeyCredential) { msg('Biométrie non supportée.', 'error'); return; }
-  if (!serverChallenge) { msg('⚠️ Revérifiez votre code employé avant de pointer.', 'error'); return; }
+  if (type === 'depart' && !dayState.can_depart) { msg('⚠️ Vous devez pointer l\'arrivée avant le départ.', 'warning'); return; }
+  if (type === 'arrivee' && !dayState.can_arrivee) { msg('Arrivée déjà effectuée aujourd\'hui.', 'warning'); return; }
+
+  const code  = document.getElementById('code_employe').value.trim();
+  const fd = new FormData();
+  fd.append('action',       'pointer');
+  fd.append('code_employe', code);
+  fd.append('type',         type);
+  fd.append('latitude',     document.getElementById('lat').value);
+  fd.append('longitude',    document.getElementById('lng').value);
+  fd.append('adresse',      document.getElementById('adresse_field').value);
 
   const label = type === 'arrivee' ? 'Arrivée' : 'Départ';
-  const code  = document.getElementById('code_employe').value.trim();
-
-  try {
-    msg('👆 Posez votre doigt pour valider ' + label + '...', 'info');
-
-    const assertion = await navigator.credentials.get({
-      publicKey: { challenge: serverChallenge, userVerification: "required", timeout: 60000 }
-    });
-
-    // Send assertion to server: challenge + origin verified before granting token
-    const vfd = new FormData();
-    vfd.append('action',             'verify_assertion');
-    vfd.append('code_employe',       code);
-    vfd.append('client_data_json',   bytesToB64url(new Uint8Array(assertion.response.clientDataJSON)));
-    vfd.append('authenticator_data', bytesToB64url(new Uint8Array(assertion.response.authenticatorData)));
-    vfd.append('signature',          bytesToB64url(new Uint8Array(assertion.response.signature)));
-    vfd.append('credential_id',      bytesToB64url(new Uint8Array(assertion.rawId)));
-
-    msg('🔐 Vérification biométrique côté serveur...', 'info');
-    const vData = await postAction(vfd);
-    serverChallenge = null; // consumed regardless of outcome
-
-    if (!vData.success) {
-      msg(vData.message || 'Vérification biométrique échouée.', 'error');
-      return;
-    }
-
-    // Server assertion token set — now record attendance
-    const fd = new FormData();
-    fd.append('action',       'pointer');
-    fd.append('code_employe', code);
-    fd.append('type',         type);
-    fd.append('latitude',     document.getElementById('lat').value);
-    fd.append('longitude',    document.getElementById('lng').value);
-    fd.append('adresse',      document.getElementById('adresse_field').value);
-
-    const data = await postAction(fd);
-    msg(data.message, data.success ? 'success' : (data.warning ? 'warning' : 'error'));
-
-  } catch (e) {
-    msg(e.name === 'NotAllowedError' ? '❌ Empreinte refusée ou annulée. Réessayez.' : '❌ Erreur : ' + e.message, 'error');
+  msg('Validation ' + label + '...', 'info');
+  const data = await postAction(fd);
+  msg(data.message, data.success ? 'success' : (data.warning ? 'warning' : 'error'));
+  if (data.success) {
+    await verifierCode(true);
   }
 }
+
+buildDeviceFingerprint().catch(() => {
+  msg('Impossible de préparer l\'identifiant appareil.', 'error');
+});
 </script>
 </body>
 </html>

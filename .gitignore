@@ -1,0 +1,30 @@
+# Composer dependencies
+/vendor/
+composer.lock
+
+# PHP config with credentials (keep config.php in repo but ignore local overrides)
+# config.local.php
+
+# XAMPP / server logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Exported files
+*.xlsx
+*.xls
+*.csv
+*.zip
+
+# PHPUnit
+phpunit.xml
+.phpunit.result.cache

@@ -121,7 +121,7 @@ foreach ($semaines as $titre_sem => $lignes) {
         $sheet->setCellValue('E'.$row, $type_label);
         $sheet->setCellValue('F'.$row, date('H:i', strtotime($p['heure'])));
         $sheet->setCellValue('G'.$row, date('d/m/Y', strtotime($p['date_pointage'])));
-        $sheet->setCellValue('H'.$row, ($p['verification_method'] ?? 'webauthn') === 'otp_fallback' ? 'OTP manager' : 'Empreinte');
+        $sheet->setCellValue('H'.$row, ($p['verification_method'] ?? 'webauthn') === 'otp_fallback' ? 'OTP manager' : 'Appareil lié');
         $sheet->setCellValue('I'.$row, $gps);
 
         $bg = ($row % 2 === 0) ? 'F7F9FC' : 'FFFFFF';
